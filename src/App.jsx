@@ -22,7 +22,7 @@ import HistoryView from './components/HistoryView';
 import SettingsView from './components/SettingsView';
 import ProfileView from './components/ProfileView';
 import MobileBottomNav from './components/MobileBottomNav';
-import { BACKEND_URL, API_BASE } from './services/api';
+import { BACKEND_URL, API_BASE, getSocketTarget } from './services/api';
 
 export default function App() {
   const [activeTab, setActiveTab] = useState('Dashboard');
@@ -34,6 +34,7 @@ export default function App() {
   const [pollError, setPollError] = useState(null);
   const [isMobilePreview, setIsMobilePreview] = useState(false);
   const [backendConnected, setBackendConnected] = useState(false);
+  const [isWsConnected, setIsWsConnected] = useState(false);
   const [lastPacketTime, setLastPacketTime] = useState(null);
 
   // Meter configuration state
@@ -60,81 +61,90 @@ export default function App() {
     return () => clearInterval(timer);
   }, []);
 
-  // Connect to MERN Backend via Socket.IO
+  // Connect to MERN Backend via Socket.IO (if backend URL is configured)
   useEffect(() => {
     let socket;
-    try {
-      const socketTarget = BACKEND_URL || (typeof window !== 'undefined' ? window.location.origin : '');
-      socket = socketTarget
-        ? io(socketTarget, {
-            transports: ['websocket', 'polling'],
-            reconnectionAttempts: 20,
-            reconnectionDelay: 1500,
-          })
-        : io({
-            transports: ['websocket', 'polling'],
-            reconnectionAttempts: 20,
-            reconnectionDelay: 1500,
-          });
+    const socketTarget = getSocketTarget();
 
-      socket.on('connect', () => {
-        console.log('[MERN Socket.IO] Connected to backend at', socketTarget || 'current origin');
-        setBackendConnected(true);
-      });
+    if (socketTarget) {
+      try {
+        socket = io(socketTarget, {
+          transports: ['websocket', 'polling'],
+          reconnectionAttempts: 15,
+          reconnectionDelay: 2000,
+        });
 
-      socket.on('disconnect', () => {
-        console.log('[MERN Socket.IO] Disconnected from backend');
-        setBackendConnected(false);
-      });
+        socket.on('connect', () => {
+          console.log('[MERN Socket.IO] Connected to backend at', socketTarget);
+          setIsWsConnected(true);
+          setBackendConnected(true);
+        });
 
-      socket.on('connect_error', (err) => {
-        console.warn('[Socket.IO] Connection error (retrying):', err.message);
-        setBackendConnected(false);
-      });
+        socket.on('disconnect', () => {
+          console.log('[MERN Socket.IO] Disconnected from backend');
+          setIsWsConnected(false);
+        });
 
-      // Receive real-time telemetry from ESP32 via backend
-      socket.on('telemetry:live', (data) => {
-        if (data && data.reading) {
-          const r = data.reading;
-          setVoltage(typeof r.voltage === 'number' ? Number(r.voltage.toFixed(1)) : parseFloat(r.voltage) || 0);
-          setCurrent(typeof r.current === 'number' ? Number(r.current.toFixed(3)) : parseFloat(r.current) || 0);
-          setPower(typeof r.power === 'number' ? Number(r.power.toFixed(1)) : parseFloat(r.power) || 0);
-          setEnergyUsed(typeof r.energy === 'number' ? Number(r.energy.toFixed(4)) : parseFloat(r.energy) || 0);
-          setSecondsAgo(0);
-          setLastPacketTime(new Date());
+        socket.on('connect_error', (err) => {
+          console.warn('[Socket.IO] Connection error (retrying):', err.message);
+          setIsWsConnected(false);
+        });
 
-          if (data.tariffRate) setTariffRate(data.tariffRate);
-          if (data.deviceStatus) {
-            setEspDevice(data.deviceStatus);
-            if (data.deviceStatus.relayState !== undefined) {
-              setRelayState(data.deviceStatus.relayState);
+        // Receive real-time telemetry from ESP32 via backend
+        socket.on('telemetry:live', (data) => {
+          if (data && data.reading) {
+            const r = data.reading;
+            setVoltage(typeof r.voltage === 'number' ? Number(r.voltage.toFixed(1)) : parseFloat(r.voltage) || 0);
+            setCurrent(typeof r.current === 'number' ? Number(r.current.toFixed(3)) : parseFloat(r.current) || 0);
+            setPower(typeof r.power === 'number' ? Number(r.power.toFixed(1)) : parseFloat(r.power) || 0);
+            setEnergyUsed(typeof r.energy === 'number' ? Number(r.energy.toFixed(4)) : parseFloat(r.energy) || 0);
+            setSecondsAgo(0);
+            setLastPacketTime(new Date());
+
+            if (data.tariffRate) setTariffRate(data.tariffRate);
+            if (data.deviceStatus) {
+              setEspDevice(data.deviceStatus);
+              if (data.deviceStatus.relayState !== undefined) {
+                setRelayState(data.deviceStatus.relayState);
+              }
+            }
+
+            if (r.isSimulated) {
+              setDataSource('simulated');
+            } else {
+              setDataSource('esp32');
+              setIsLiveSimulating(false);
             }
           }
+        });
 
-          if (r.isSimulated) {
-            setDataSource('simulated');
-          } else {
-            setDataSource('esp32');
-            // If real ESP32 packet received, disable any running simulation
-            setIsLiveSimulating(false);
+        // Receive remote relay switch events
+        socket.on('device:relay', (data) => {
+          if (data && data.relayState !== undefined) {
+            setRelayState(data.relayState);
           }
-        }
-      });
-
-      // Receive remote relay switch events
-      socket.on('device:relay', (data) => {
-        if (data && data.relayState !== undefined) {
-          setRelayState(data.relayState);
-        }
-      });
-    } catch (e) {
-      console.warn('[Socket.IO] Connection error:', e);
+        });
+      } catch (e) {
+        console.warn('[Socket.IO] Initialization error:', e);
+      }
+    } else {
+      console.info('[App] WebSocket to static host skipped. Real-time updates active via HTTP polling.');
     }
 
-    // Fetch initial state from backend REST API
-    fetch(`${API_BASE}/telemetry/live`)
-      .then((res) => res.json())
-      .then((json) => {
+    return () => {
+      if (socket) socket.disconnect();
+    };
+  }, []);
+
+  // HTTP Polling fallback: polls /api/telemetry/live every 3s when Socket.IO is inactive
+  useEffect(() => {
+    let timer;
+
+    const fetchLiveState = async () => {
+      try {
+        const res = await fetch(`${API_BASE}/telemetry/live`);
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
         if (json.success && json.data) {
           const d = json.data;
           if (d.voltage !== undefined) setVoltage(Number(Number(d.voltage).toFixed(1)));
@@ -143,17 +153,28 @@ export default function App() {
           if (d.energy !== undefined) setEnergyUsed(Number(Number(d.energy).toFixed(4)));
           if (d.tariffRate) setTariffRate(d.tariffRate);
           if (d.relayState !== undefined) setRelayState(d.relayState);
+          setSecondsAgo(0);
+          setLastPacketTime(new Date());
           setBackendConnected(true);
         }
-      })
-      .catch((err) => {
-        console.log('[Backend] Waiting for backend at ' + (BACKEND_URL || API_BASE));
-      });
+      } catch (err) {
+        if (!isWsConnected) {
+          setBackendConnected(false);
+        }
+      }
+    };
+
+    fetchLiveState();
+
+    // If WebSocket is not connected, keep polling every 3 seconds
+    if (!isWsConnected) {
+      timer = setInterval(fetchLiveState, 3000);
+    }
 
     return () => {
-      if (socket) socket.disconnect();
+      if (timer) clearInterval(timer);
     };
-  }, []);
+  }, [isWsConnected]);
 
   // Poll ESP32 directly via backend
   const handlePollEsp32 = async () => {
